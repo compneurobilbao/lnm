@@ -7,6 +7,11 @@ brain_template=${project_path}/data/MNI152_T1_2mm_brain.nii.gz
 lesion_mask=${project_path}/data/lesion/${lesion_name}.nii.gz
 normative_population=${project_path}/data/participants.tsv
 
+nvox_lesion=$(mrdump $lesion_mask | awk '{ sum += $1 } END { print sum }') 
+fibr_to_select=$(echo "${nvox_lesion} * 100" | bc -l)
+
+echo "Number of streamlines to select: ${fibr_to_select}"
+
 mrcalc -force $brain_template -neg $brain_template -add \
     ${project_path}/data/structural_disconnectivity/${lesion_name}_Sdisconnectivity.nii.gz
 
@@ -20,7 +25,7 @@ do
         -o ${project_path}/data/dwi/${sub}/${lesion_name}_subSpace.nii.gz -n NearestNeighbor -v 1
 
     tckgen -seed_image  ${project_path}/data/dwi/${sub}/dwi_mask.nii.gz -angle 45  \
-        -maxlength 200 -select 300000 -algorithm FACT -downsample 5 -force \
+        -maxlength 200 -select $fibr_to_select -algorithm FACT -downsample 5 -force \
         ${project_path}/data/dwi/${sub}/dwi_directions.nii.gz \
         -include  ${project_path}/data/dwi/${sub}/${lesion_name}_subSpace.nii.gz \
         ${project_path}/data/dwi/${sub}/lesion_streamlines.tck
