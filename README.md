@@ -8,3 +8,5 @@ This tool computes the functional and structural dysconnectivity maps for a give
     <img src="docs/lnm_logo.png" alt="Description" width="200"/>
 </p>
 
+## CITE
+Antonio Jimenez-Marin, Silke Boulanger, Iñigo Tellaetxe-Elorriaga, Iñaki Escudero, Ivan Gil De Sousa, Marimar Freijo, Pedro I Tejada, Asier Erramuzpe, Jesus M. Cortes. COGNET-STROKE: A NOVEL BRAIN DYSCONNECTIVITY TOOL FOR PREDICTION OF COGNITIVE DEFICITS AFTER STROKE. MedRxiv. 2025. https://doi.org/10.1101/2023.08.04.551953
