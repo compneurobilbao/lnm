@@ -1,63 +1,97 @@
-import os
-import sys
+#!/usr/bin/env python3
+
+import argparse
+from pathlib import Path
+
+import nibabel as nib
 import numpy as np
 import pandas as pd
-import seaborn as sns
-import matplotlib.pyplot as plt
-import nibabel as nib
-from nilearn.maskers import NiftiMasker
 from nilearn.glm.second_level import SecondLevelModel
-
-project_path = sys.argv[1]
-lesion_name = sys.argv[2]
+from nilearn.maskers import NiftiMasker
 
 
-gm_mask = nib.load(os.path.join(project_path, "data", "gm_mask_2mm.nii.gz"))
-gm_vol = gm_mask.get_fdata()
-
-lesion_mask = nib.load(
-    os.path.join(project_path, "data", "lesion", lesion_name + ".nii.gz")
-)
-lesion_vol = lesion_mask.get_fdata()
-
-lesion_cut = nib.Nifti1Image(lesion_vol * gm_vol, lesion_mask.affine)
-
-lesion_masker = NiftiMasker(mask_img=lesion_cut, standardize="zscore_sample")
-gm_masker = NiftiMasker(mask_img=gm_mask, standardize="zscore_sample")
-
-normative_population = pd.read_csv(
-    os.path.join(project_path, "data", "participants.tsv"), sep="\t"
-)
-
-seed_to_voxel_correlations_group = []
-for sub in normative_population["ID"]:
-    resting_img = nib.load(
-        os.path.join(project_path, "data", "func", sub, sub + "_preprocessed.nii.gz")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Compute a functional disconnectivity map for one lesion."
     )
-    ts_lesion = lesion_masker.fit_transform(resting_img).mean(axis=1).reshape(-1, 1)
-    ts_gm = gm_masker.fit_transform(resting_img)
-    seed_to_voxel_correlations = np.dot(ts_gm.T, ts_lesion) / ts_lesion.shape[0]
-    seed_to_voxel_correlations_fisher_z = np.arctanh(seed_to_voxel_correlations)
+    parser.add_argument(
+        "project_path",
+        type=Path,
+        help="Project directory containing the data directory.",
+    )
+    parser.add_argument(
+        "lesion_name",
+        help="Lesion filename without the .nii.gz extension.",
+    )
+    return parser.parse_args()
 
-    seed_to_voxel_correlations_group.append(
-        gm_masker.inverse_transform(seed_to_voxel_correlations_fisher_z.T)
+
+def require_file(path: Path) -> Path:
+    if not path.is_file():
+        raise FileNotFoundError(f"Required input file not found: {path}")
+    return path
+
+
+def main() -> None:
+    args = parse_args()
+    data_dir = args.project_path.resolve() / "data"
+
+    gm_mask = nib.load(require_file(data_dir / "gm_mask_2mm.nii.gz"))
+    gm_vol = gm_mask.get_fdata()
+
+    lesion_path = require_file(data_dir / "lesion" / f"{args.lesion_name}.nii.gz")
+    lesion_mask = nib.load(lesion_path)
+    lesion_vol = lesion_mask.get_fdata()
+    if lesion_vol.shape != gm_vol.shape:
+        raise ValueError(
+            f"Lesion and grey-matter masks have different shapes: "
+            f"{lesion_vol.shape} != {gm_vol.shape}"
+        )
+
+    lesion_cut = nib.Nifti1Image(lesion_vol * gm_vol, lesion_mask.affine)
+    if not np.any(lesion_cut.get_fdata()):
+        raise ValueError(f"Lesion does not overlap the grey-matter mask: {lesion_path}")
+
+    lesion_masker = NiftiMasker(mask_img=lesion_cut, standardize="zscore_sample")
+    gm_masker = NiftiMasker(mask_img=gm_mask, standardize="zscore_sample")
+
+    participants_path = require_file(data_dir / "participants.tsv")
+    normative_population = pd.read_csv(participants_path, sep="\t")
+    if "ID" not in normative_population:
+        raise ValueError(f"Missing ID column in {participants_path}")
+    if normative_population.empty:
+        raise ValueError(f"No participants found in {participants_path}")
+
+    seed_to_voxel_correlations_group = []
+    for subject_id in normative_population["ID"].astype(str):
+        resting_path = require_file(
+            data_dir / "func" / subject_id / f"{subject_id}_preprocessed.nii.gz"
+        )
+        resting_img = nib.load(resting_path)
+        ts_lesion = lesion_masker.fit_transform(resting_img).mean(axis=1).reshape(-1, 1)
+        ts_gm = gm_masker.fit_transform(resting_img)
+        seed_to_voxel_correlations = np.dot(ts_gm.T, ts_lesion) / ts_lesion.shape[0]
+        fisher_z = np.arctanh(seed_to_voxel_correlations)
+        seed_to_voxel_correlations_group.append(gm_masker.inverse_transform(fisher_z.T))
+
+    design_matrix = pd.DataFrame(
+        {"intercept": np.ones(len(seed_to_voxel_correlations_group))}
+    )
+    second_level_model = SecondLevelModel().fit(
+        seed_to_voxel_correlations_group,
+        design_matrix=design_matrix,
+    )
+    z_map = second_level_model.compute_contrast(
+        second_level_contrast="intercept",
+        output_type="z_score",
     )
 
-second_level_model = SecondLevelModel()
-design_matrix = pd.DataFrame(
-    [1] * len(seed_to_voxel_correlations_group),
-    columns=["intercept"],
-)
-second_level_model = second_level_model.fit(
-    seed_to_voxel_correlations_group,
-    design_matrix=design_matrix,
-)
+    output_dir = data_dir / "functional_disconnectivity"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{args.lesion_name}_Fdisconnectivity.nii.gz"
+    z_map.to_filename(output_path)
+    print(f"Functional disconnectivity map written to {output_path}")
 
-z_map = second_level_model.compute_contrast(
-    second_level_contrast="intercept",
-    output_type="z_score",
-)
 
-z_map.to_filename(
-    os.path.join(project_path, "data", "functional_disconnectivity", lesion_name + "_Fdisconnectivity.nii.gz")
-)
+if __name__ == "__main__":
+    main()
