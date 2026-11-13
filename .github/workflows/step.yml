@@ -1,0 +1,177 @@
+name: Step
+
+# Contract step for tract-wise structural disconnection (card F0-25): unit tests, image build,
+# reference test under Docker and Apptainer with outputs validated by the contract validator,
+# and a comparison with the former src/lnm_tracts.sh run on the same synthetic input. The SDK
+# and the contract files come from the public stroke-server repository at the commit pinned in
+# step/ci/STROKE_SERVER_SHA. All data is synthetic and generated in CI; nothing is downloaded.
+
+on:
+  pull_request:
+    paths: ["step/**", "src/lnm_tracts.sh", ".github/workflows/step.yml"]
+  push:
+    branches: [main]
+    paths: ["step/**", "src/lnm_tracts.sh", ".github/workflows/step.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: step-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: lnm-tracts-step:ci
+  LEGACY_IMAGE: lnm-tracts-legacy:ci
+  APPTAINER_VERSION: "1.5.5"
+  APPTAINER_DEB_SHA256: "25095d3711504b3e8657dbb2e172ef8db9db43c4503d940c9c36b105db8dce77"
+
+jobs:
+  unit:
+    name: Unit tests and manifest validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-python@v5.3.0
+        with:
+          python-version: "3.12"
+      - name: Fetch pinned contract files and SDK
+        run: step/ci/fetch_pinned.sh "$RUNNER_TEMP/pinned"
+      - name: Install
+        run: |
+          pip install numpy==2.2.6 nibabel==5.3.2 PyYAML==6.0.2 jsonschema==4.23.0 pytest==8.3.3
+          pip install --no-deps "$RUNNER_TEMP/pinned/steps/sdk"
+      - name: Manifest is valid
+        run: python "$RUNNER_TEMP/pinned/contracts/validate.py" --kind step step/step.yaml
+      - name: Tests (the tests that need MRtrix3 run in the container job)
+        env:
+          STEP_CONTRACTS_DIR: ${{ runner.temp }}/pinned/contracts
+        run: python -m pytest step/tests -q -rs
+
+  container:
+    name: Reference test and legacy comparison (Docker, Apptainer)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-python@v5.3.0
+        with:
+          python-version: "3.12"
+      - name: Fetch pinned contract files and SDK
+        run: step/ci/fetch_pinned.sh "$RUNNER_TEMP/pinned"
+      - name: Install SDK on the host (reference-test runner and validator)
+        run: |
+          pip install numpy==2.2.6 nibabel==5.3.2 PyYAML==6.0.2 jsonschema==4.23.0
+          pip install --no-deps "$RUNNER_TEMP/pinned/steps/sdk"
+          echo "STEP_CONTRACTS_DIR=$RUNNER_TEMP/pinned/contracts" >> "$GITHUB_ENV"
+
+      - name: Generate the synthetic toy atlas and lesions
+        run: |
+          python step/tests/make_reference.py "$STEP_CONTRACTS_DIR" step/tests/reference > /dev/null
+          python "$STEP_CONTRACTS_DIR/validate.py" step/tests/reference/bundle/bundle.yaml
+          mkdir -p artifacts
+          cp step/tests/reference/expected/tract_disconnection.tsv artifacts/expected-main.tsv
+
+      - name: Build the step image (MRtrix3 tckedit and tckstats from the pinned source)
+        run: docker build -f step/Dockerfile --build-arg STROKE_SERVER_SHA="$(cat step/ci/STROKE_SERVER_SHA)" -t "$IMAGE" .
+      - name: Build the legacy image (same MRtrix3 plus bc, with the unmodified src/lnm_tracts.sh)
+        run: docker build -f step/Dockerfile --target legacy -t "$LEGACY_IMAGE" .
+
+      - name: Image checks
+        run: |
+          docker run --rm --entrypoint /bin/sh "$IMAGE" -c '
+            set -eu
+            test -x /usr/local/bin/run
+            test -r /opt/step/step.yaml
+            for d in /in /out /ref /tmp; do test -d "$d"; test -z "$(ls -A "$d")"; done
+            test -z "$(find /opt/step /opt/mrtrix3 /usr/local/bin/run -not -perm -o=r)"
+            tckedit -version
+          '
+          docker run --rm --entrypoint cat "$IMAGE" /opt/step/step.yaml | cmp - step/step.yaml
+
+      - name: Reference test under Docker (contract section 6 flags)
+        run: |
+          stroke-step-reftest --step-dir step --mode docker --image "$IMAGE" \
+            --bundle tract_atlas=step/tests/reference/bundle \
+            --workdir "$RUNNER_TEMP/docker-run" --save-provenance artifacts/provenance-main.json
+          cp "$RUNNER_TEMP/docker-run/out/tract_disconnection.tsv" artifacts/tract_disconnection-main.tsv
+          cat artifacts/tract_disconnection-main.tsv
+
+      - name: Validate manifest and provenance with contracts/validate.py
+        run: |
+          python "$STEP_CONTRACTS_DIR/validate.py" step/step.yaml artifacts/provenance-main.json
+          python step/ci/check_provenance_bundle.py artifacts/provenance-main.json step/tests/reference/bundle/bundle.yaml
+
+      - name: Every lesion, all containers at once on one read-only atlas mount
+        run: step/ci/run_cases.sh "$IMAGE" step/tests/reference "$RUNNER_TEMP/cases"
+
+      - name: Tables equal the independent numpy oracle
+        run: python step/ci/compare_oracle.py "$RUNNER_TEMP/cases" step/tests/reference/cases/expected
+
+      - name: The former lnm_tracts.sh on the same input; results equal 1 - Disc
+        run: |
+          docker run --rm -v "$PWD/step/tests/reference/legacy_project:/work" "$LEGACY_IMAGE" \
+            bash /opt/legacy/lnm_tracts.sh /work
+          cp step/tests/reference/legacy_project/data/lnm_tracts.csv artifacts/legacy-lnm_tracts.csv
+          cat artifacts/legacy-lnm_tracts.csv
+          python step/ci/compare_legacy.py artifacts/legacy-lnm_tracts.csv "$RUNNER_TEMP/cases" | tee artifacts/legacy-comparison.txt
+          {
+            echo "### Step versus the former lnm_tracts.sh (Disc = surviving fraction; step = 1 - Disc)"
+            echo '```'
+            cat artifacts/legacy-comparison.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: An empty lesion mask is rejected with mask_empty (exit 10)
+        run: |
+          work="$RUNNER_TEMP/empty"
+          mkdir -p "$work/in" "$work/out"
+          chmod 777 "$work/out"
+          python step/ci/make_empty_mask.py "$STEP_CONTRACTS_DIR" "$work/in/lesion_mask.nii.gz"
+          echo '{}' > "$work/in/params.json"
+          set +e
+          docker run --rm --read-only --user 12345:12345 --cap-drop ALL \
+            --security-opt no-new-privileges --network none --tmpfs /tmp:rw,mode=1777,size=2g \
+            -v "$work/in:/in:ro" -v "$work/out:/out" -v "$PWD/step/tests/reference/bundle:/ref/tract_atlas:ro" \
+            -e HOME=/tmp -e TMPDIR=/tmp -e TZ=UTC -e STEP_CPUS=2 \
+            --entrypoint /usr/local/bin/run "$IMAGE" --in /in --out /out --params /in/params.json
+          code=$?
+          set -e
+          echo "exit code: $code"
+          cat "$work/out/error.json"
+          test "$code" -eq 10
+          grep -q '"code": *"mask_empty"' "$work/out/error.json"
+          python "$STEP_CONTRACTS_DIR/validate.py" step/step.yaml "$work/out/provenance.json" "$work/out/error.json"
+
+      - name: Install Apptainer (official release package)
+        run: |
+          deb="apptainer_${APPTAINER_VERSION}_amd64.deb"
+          curl -sSfL -o "$RUNNER_TEMP/$deb" "https://github.com/apptainer/apptainer/releases/download/v${APPTAINER_VERSION}/${deb}"
+          echo "${APPTAINER_DEB_SHA256}  $RUNNER_TEMP/$deb" | sha256sum -c -
+          sudo apt-get update -q
+          sudo apt-get install -y -q "$RUNNER_TEMP/$deb"
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          apptainer --version
+
+      - name: Build the SIF from the Docker image
+        run: |
+          sudo apptainer build --build-arg IMAGE="$IMAGE" "$RUNNER_TEMP/step.sif" step/Apptainer.def
+          sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/step.sif"
+
+      - name: Reference test under Apptainer (--containall --cleanenv --no-home)
+        run: |
+          stroke-step-reftest --step-dir step --mode apptainer --sif "$RUNNER_TEMP/step.sif" \
+            --bundle tract_atlas=step/tests/reference/bundle \
+            --workdir "$RUNNER_TEMP/apptainer-run" --save-provenance artifacts/provenance-apptainer.json
+          python "$STEP_CONTRACTS_DIR/validate.py" step/step.yaml artifacts/provenance-apptainer.json
+          cmp "$RUNNER_TEMP/docker-run/out/tract_disconnection.tsv" "$RUNNER_TEMP/apptainer-run/out/tract_disconnection.tsv"
+          echo "tables identical between Docker and Apptainer"
+
+      - uses: actions/upload-artifact@v4.6.0
+        if: always()
+        with:
+          name: step-artifacts
+          path: artifacts/
+          if-no-files-found: warn
