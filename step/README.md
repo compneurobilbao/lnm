@@ -1,6 +1,6 @@
 # Tract-wise structural disconnection step
 
-Contract step (step contract 1.0) that ports `src/lnm_tracts.sh`: for every tract of an atlas,
+Contract step (step contract 1.0, step version 1.1.0) that ports `src/lnm_tracts.sh`: for every tract of an atlas,
 count the streamlines, remove those passing through the lesion with `tckedit -exclude`, count
 again. Voxel-wise structural disconnection (`src/lnm_structural.sh`) is a different step.
 
@@ -10,7 +10,7 @@ again. Voxel-wise structural disconnection (`src/lnm_structural.sh`) is a differ
   is `1 - Disc` of the old script. The script printed `Disc` truncated to three decimals by `bc`;
   the step computes the fraction from the integer counts, so the two agree to within 0.001.
 - Bundle `tract_atlas` (type `tract-atlas`), mounted at `/ref/tract_atlas`: `labels.txt` (one tract
-  name per line) and one `<tract name>.tck` per name, in MNI152NLin6Asym millimetre coordinates.
+  name per line) and one `<tract name>.tck` per name, in the millimetre coordinates of the space its `metadata.space` declares (MNI152NLin6Asym when absent; see "Atlas space" below).
   This is the layout of the former `yeh_tracts` directory, so the HCP1065 atlas needs no conversion;
   the bundle itself (with `bundle.yaml`) is provided separately and is not part of this repository.
 - The atlas is read-only; all scratch is in `/tmp`, so any number of cases can run at once on the
@@ -21,3 +21,38 @@ lesions, with expected values computed in numpy). `.github/workflows/step.yml` a
 unmodified `src/lnm_tracts.sh` on the same input and compares it with the step.
 
 Local image: `docker build -f step/Dockerfile -t lnm-tracts-step:dev .` from the repository root.
+
+## Atlas space (step 1.1.0)
+
+The lesion mask is in MNI152NLin6Asym. A tract atlas bundle may declare the space of its
+streamline coordinates in `metadata.space` of its `bundle.yaml`:
+
+- no `metadata.space`, or `MNI152NLin6Asym`: the lesion is used as it is, exactly as in 1.0.0
+  (a mounted `space_transform` bundle is then ignored);
+- any other space (for example `MNI152NLin2009aAsym` for the HCP1065 atlas of Yeh 2022): the
+  lesion is first resampled into the atlas space with the optional bundle `space_transform`
+  (type `space-transform`, mounted at `/ref/space_transform`). Without it the step stops with
+  the internal failure `space_transform_missing`; a transform for another pair of spaces gives
+  `space_transform_mismatch`.
+
+Layout of a `space-transform` bundle: `bundle.yaml` with `metadata.from_space`
+(`MNI152NLin6Asym`) and `metadata.to_space` (the atlas space), and `coordinate_map.nii.gz`, a
+float image of shape (X, Y, Z, 3) on a grid of the atlas space whose voxel (i, j, k) holds the
+RAS millimetre position in MNI152NLin6Asym of its centre (the image-resampling direction that
+ANTs and TemplateFlow call `mode-image`). The step needs only nibabel and numpy for it.
+
+Resampling is nearest neighbour onto the grid of the coordinate map. The lesion is a binary
+label: nearest neighbour introduces no new values and needs no threshold, keeps the volume
+(2 mm to 1 mm on the same field of view maps every voxel to exactly eight) and keeps small or
+thin lesions, which linear interpolation followed by a 0.5 threshold erodes (a single 2 mm voxel
+keeps about 27% of its volume, and with `tckedit -exclude` any streamline that touches
+the lesion counts). Voxel counts and volumes before and after are written to the provenance
+warning `lesion_resampled_to_atlas_space` and to `extra/atlas_space_resampling.json`; the
+resampled mask is kept as `extra/lesion_mask_atlas_space.nii.gz`. A lesion that has no voxel
+left on the atlas grid is rejected with `mask_outside_atlas_space`. The output table has the
+same format as before.
+
+Tests use synthetic spaces only (`tests/make_reference.py`, `space/`): the toy atlas declaring
+`ToyAtlasSpace`, an identity transform (tables identical to the runs without a transform) and a
+4 mm shift (tables equal to the numpy oracle on lesions moved by 4 mm). No real template is
+needed in CI.
