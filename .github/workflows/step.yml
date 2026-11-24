@@ -110,6 +110,22 @@ jobs:
       - name: Tables equal the independent numpy oracle
         run: python step/ci/compare_oracle.py "$RUNNER_TEMP/cases" step/tests/reference/cases/expected
 
+      - name: Atlas in another space (1.1.0), lesion resampled with a space-transform bundle
+        run: |
+          step/ci/run_space_cases.sh "$IMAGE" step/tests/reference "$RUNNER_TEMP/space"
+          python step/ci/compare_oracle.py "$RUNNER_TEMP/space" step/tests/reference/space/expected
+          # identity transform: byte-identical tables to the runs without any transform
+          cmp "$RUNNER_TEMP/space/identity_main.tsv" "$RUNNER_TEMP/cases/main.tsv"
+          cmp "$RUNNER_TEMP/space/identity_small.tsv" "$RUNNER_TEMP/cases/small.tsv"
+          ! cmp -s "$RUNNER_TEMP/space/shift_main.tsv" "$RUNNER_TEMP/cases/main.tsv"
+          for d in "$RUNNER_TEMP"/space/*/out; do
+            docs=("$d/provenance.json"); [ -f "$d/error.json" ] && docs+=("$d/error.json")
+            python "$STEP_CONTRACTS_DIR/validate.py" step/step.yaml "${docs[@]}"
+          done
+          mkdir -p artifacts/space
+          cp "$RUNNER_TEMP"/space/*.tsv artifacts/space/
+          cp "$RUNNER_TEMP/space/shift_main/out/provenance.json" artifacts/space/provenance-shift_main.json
+
       - name: The former lnm_tracts.sh on the same input; results equal 1 - Disc
         run: |
           docker run --rm -v "$PWD/step/tests/reference/legacy_project:/work" "$LEGACY_IMAGE" \
